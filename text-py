@@ -1,137 +1,71 @@
 import pandas as pd
-import re
 from collections import Counter
 
-def _tokenize_line(line: str):
-    """Split a markdown table line by '|' but keep internal empty cells.
-    Trim outer fence pipes only."""
-    if '|' not in line:
-        return []
-    parts = [p.strip() for p in line.strip("\n").split("|")]
-    # drop outer fence empties once
-    if parts and parts[0] == "":
-        parts = parts[1:]
-    if parts and parts[-1] == "":
-        parts = parts[:-1]
-    # keep internal empty strings to preserve column count
-    return parts
-
-def _is_blank_row(cells):
-    return len(cells) == 0 or all(c == "" for c in cells)
-
-def _alpha_score(text: str) -> int:
-    """Score cells higher if they contain letters or common header tokens."""
-    score = 0
-    if re.search(r"[A-Za-z]", text):
-        score += 2
-    if re.search(r"(qty|quantity|desc|description|price|amount|total|tax|item|uom|unit|rate|hsn|code|date|no\.?)", text, re.I):
-        score += 2
-    # penalize pure numbers
-    if re.fullmatch(r"[+-]?(\d+(\.\d+)?)", text):
-        score -= 1
-    return score
-
-def _pick_header_index(block):
-    """Pick the header row among rows in a block with the modal column count."""
-    if not block:
-        return None, None
-    lengths = [len(r) for r in block if not _is_blank_row(r)]
-    if not lengths:
-        return None, None
-    modal_len = Counter(lengths).most_common(1)[0][0]
-    candidates = [(i, r) for i, r in enumerate(block) if len(r) == modal_len and not _is_blank_row(r)]
-    if not candidates:
-        return None, None
-    # score each candidate: sum of cell alpha scores + prefer earlier rows slightly
-    best_i, best_score = None, float("-inf")
-    for i, row in candidates:
-        score = sum(_alpha_score(c) for c in row) - i*0.01
-        if score > best_score:
-            best_score, best_i = score, i
-    return best_i, modal_len
-
-def _make_unique_headers(headers):
-    # replace empty names with placeholders, then make unique
-    headers = [h if h else f"col{i+1}" for i, h in enumerate(headers)]
-    seen = {}
-    out = []
-    for h in headers:
-        base = h
-        if base not in seen:
-            seen[base] = 1
-            out.append(base)
-        else:
-            seen[base] += 1
-            out.append(f"{base}_{seen[base]}")
-    return out
-
-def parse_markdown_tables(md_text: str, add_table_id: bool = True) -> pd.DataFrame:
-    # 1) Tokenize all lines
-    raw_lines = md_text.splitlines()
+def parse_markdown_tables(md_text, add_table_id=True):
+    # Step 1: Tokenize each line
     rows = []
-    for line in raw_lines:
-        cells = _tokenize_line(line)
-        # treat non-pipe text as a blank/break
-        if '|' not in line or _is_blank_row(cells):
-            rows.append([])
-        else:
+    for line in md_text.strip().split("\n"):
+        cells = [c.strip() for c in line.split("|") if c.strip()]
+        if cells:
             rows.append(cells)
-
-    # 2) Split into contiguous non-blank blocks
-    blocks, cur = [], []
-    for r in rows:
-        if r:
-            cur.append(r)
         else:
-            if cur:
-                blocks.append(cur)
-                cur = []
-    if cur:
-        blocks.append(cur)
+            rows.append([])  # mark blank row
+
+    # Step 2: Split into contiguous non-blank blocks
+    tables, block = [], []
+    for row in rows:
+        if row:
+            block.append(row)
+        else:
+            if block:
+                tables.append(block)
+                block = []
+    if block:
+        tables.append(block)
 
     dfs = []
-    for t_idx, block in enumerate(blocks):
-        header_idx, modal_len = _pick_header_index(block)
-        if header_idx is None:
-            continue
-        headers = _make_unique_headers(block[header_idx])
+    for t_idx, block in enumerate(tables):
+        # Step 3: Identify header row by max non-numeric cells
+        header_idx, max_non_numeric = -1, -1
+        for i, row in enumerate(block):
+            non_numeric_count = sum(1 for c in row if not c.replace(".", "").isdigit())
+            if non_numeric_count > max_non_numeric:
+                max_non_numeric = non_numeric_count
+                header_idx = i
 
-        # 3) Collect continuous rows after header with same column count
+        if header_idx == -1:
+            continue
+
+        headers = block[header_idx]
         data = []
-        for r in block[header_idx+1:]:
-            if len(r) != len(headers):
+        for row in block[header_idx+1:]:
+            if len(row) != len(headers) or not row:
                 break
-            data.append(r)
+            data.append(row)
 
-        if not data:
-            continue
+        if data:
+            df = pd.DataFrame(data, columns=headers)
+            if add_table_id:
+                df.insert(0, "TableID", t_idx+1)
+            dfs.append(df)
 
-        df = pd.DataFrame(data, columns=headers)
-        if add_table_id:
-            df.insert(0, "TableID", t_idx+1)
-        dfs.append(df)
-
-    # 4) Consolidate across all tables (also works for single-table inputs)
+    # Step 4: Merge all tables into one consolidated DataFrame
     if not dfs:
-        return pd.DataFrame()  # nothing parseable
-    consolidated = pd.concat(dfs, ignore_index=True, sort=False)
-    # fill NaN (from outer union) with empty string
-    consolidated = consolidated.fillna("")
+        return pd.DataFrame()
+    consolidated = pd.concat(dfs, ignore_index=True, sort=False).fillna("")
     return consolidated
 
 # -----------------------
-# Examples:
-
-# A) Single table, no trailing blank line
+# Example: single table
 single_md = """| Item | Quantity | Price |
 | Pen  | 10       | 5     |
 | Book |          | 20    |
 | Pencil | 5      | 3     |"""
 
 df_single = parse_markdown_tables(single_md)
-# print(df_single)
+print("Single table result:\n", df_single, "\n")
 
-# B) Multiple tables, different widths
+# Example: multiple tables
 multi_md = """
 | Item | Quantity | Price |
 | Pen  | 10       | 5     |
@@ -143,4 +77,4 @@ multi_md = """
 """
 
 df_multi = parse_markdown_tables(multi_md)
-# print(df_multi)
+print("Multiple tables result:\n", df_multi)
