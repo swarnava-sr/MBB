@@ -1,121 +1,62 @@
 import pandas as pd
 
-def _tokenize_line(line: str):
+def extract_markdown_tables(md_string: str, threshold: float = 0.6):
     """
-    Split a pipe-delimited line into cells while preserving empty cells.
-    Drops only the outer fence pipes if present.
-    Returns list[str] or None if the line isn't pipe-delimited.
+    Extract tables from a markdown string into pandas DataFrames.
+    
+    Args:
+        md_string (str): Markdown text with '|' separated rows.
+        threshold (float): Fraction of max columns required to consider a row as table header.
+        
+    Returns:
+        pd.DataFrame: Concatenated dataframe of all extracted tables.
+        list[pd.DataFrame]: List of individual table dataframes.
     """
-    raw = (line or "").rstrip("\n")
-    if "|" not in raw:
-        return None
-    parts = [p.strip() for p in raw.split("|")]
-    # drop outer fence empty cells once (e.g., leading/trailing pipes)
-    if parts and parts[0] == "":
-        parts = parts[1:]
-    if parts and parts[-1] == "":
-        parts = parts[:-1]
-    # if the line is effectively empty (e.g., "||||"), treat as blank/break
-    if len(parts) == 0 or all(p == "" for p in parts):
-        return []
-    return parts
+    lines = [line.strip() for line in md_string.split("\n") if line.strip()]
+    split_lines = [line.split("|") for line in lines if "|" in line]
 
-def _is_blank_row(row):
-    return row is None or len(row) == 0
+    # Normalize: strip whitespace from each cell
+    split_lines = [[cell.strip() for cell in row if cell.strip() != ""] for row in split_lines]
 
-def _non_numeric_count(row):
-    # same simple heuristic as the first solution
-    def is_num(x):
-        x = (x or "").strip()
-        return x.replace(".", "", 1).isdigit()
-    return sum(1 for c in row if not is_num(c))
+    if not split_lines:
+        return pd.DataFrame(), []
 
-def _make_unique_headers(headers):
-    seen = {}
-    out = []
-    for h in headers:
-        name = h if h else "col"
-        if name not in seen:
-            seen[name] = 1
-            out.append(name)
+    # Determine max column count
+    max_cols = max(len(row) for row in split_lines)
+
+    tables = []
+    current_table = []
+    header_found = False
+
+    for row in split_lines:
+        if len(row) >= threshold * max_cols:
+            # Likely a header row
+            if current_table:
+                # save previous table if exists
+                try:
+                    df = pd.DataFrame(current_table[1:], columns=current_table[0])
+                except Exception:
+                    df = pd.DataFrame(current_table)
+                tables.append(df)
+                current_table = []
+            current_table.append(row)
+            header_found = True
         else:
-            seen[name] += 1
-            out.append(f"{name}_{seen[name]}")
-    return out
+            # part of table if a header was found
+            if header_found:
+                current_table.append(row)
+            else:
+                # skip junk rows before any header
+                continue
 
-def parse_markdown_multiple_tables(md_text: str, add_table_id: bool = True) -> pd.DataFrame:
-    """
-    Build on the original single-table logic:
-    - Within each contiguous non-blank block, choose header = row with max non-numeric cells
-    - Collect continuous rows after header with the same column count
-    - Repeat for subsequent blocks
-    - Outer-concat all tables, filling missing columns with ""
-    """
-    # 1) Tokenize all lines
-    lines = md_text.splitlines()
-    rows = [_tokenize_line(ln) for ln in lines]
+    # save last table
+    if current_table:
+        try:
+            df = pd.DataFrame(current_table[1:], columns=current_table[0])
+        except Exception:
+            df = pd.DataFrame(current_table)
+        tables.append(df)
 
-    # 2) Split into contiguous non-blank blocks (like separate tables/sections)
-    blocks, cur = [], []
-    for r in rows:
-        if _is_blank_row(r):
-            if cur:
-                blocks.append(cur)
-                cur = []
-        else:
-            cur.append(r)
-    if cur:
-        blocks.append(cur)
-
-    dfs = []
-    table_id = 1
-    for block in blocks:
-        if not block:
-            continue
-
-        # 3) Pick header row (max non-numeric cells) within this block
-        header_idx = max(range(len(block)), key=lambda i: _non_numeric_count(block[i]))
-        headers = _make_unique_headers(block[header_idx])
-        width = len(headers)
-
-        # 4) Collect continuous data rows after header with same width
-        data = []
-        for row in block[header_idx + 1:]:
-            if len(row) != width:
-                break
-            data.append(row)
-
-        if not data:
-            # no data after header => skip this block
-            continue
-
-        df = pd.DataFrame(data, columns=headers)
-        if add_table_id:
-            df.insert(0, "TableID", table_id)
-        dfs.append(df)
-        table_id += 1
-
-    # 5) Consolidate across all detected tables (outer union on columns)
-    if not dfs:
-        return pd.DataFrame()
-    out = pd.concat(dfs, ignore_index=True, sort=False).fillna("")
-    return out
-
-# --------- Example usage ---------
-md = """
-| Item | Quantity | Price |
-| Pen  | 10       | 5     |
-| Book |          | 20    |
-
-| Description | Amount |
-| Shipping    | 100    |
-| Tax         | 18     |
-"""
-
-df = parse_markdown_multiple_tables(md)
-print(df)
-# If you only have a single table in the MD, this works the same:
-single_md = """| Item | Quantity | Price |
-| Pen  | 10       | 5     |
-| Pencil | 5      | 3     |"""
-print(parse_markdown_multiple_tables(single_md))
+    # Concatenate
+    concatenated = pd.concat(tables, ignore_index=True) if tables else pd.DataFrame()
+    return concatenated, tables
