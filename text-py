@@ -1,7 +1,9 @@
 import pandas as pd
 import math
+from collections import Counter
 
 def _tokenize(line: str):
+    """Split a markdown line on | and trim spaces + border pipes."""
     toks = [t.strip() for t in line.split("|")]
     if toks and toks[0] == "":
         toks = toks[1:]
@@ -9,19 +11,31 @@ def _tokenize(line: str):
         toks = toks[:-1]
     return toks
 
+def _dedup_columns(cols):
+    """Ensure header columns are unique (Age, Age_2, etc.)."""
+    seen = Counter()
+    out = []
+    for c in cols:
+        name = c if c else "col"
+        seen[name] += 1
+        out.append(name if seen[name] == 1 else f"{name}_{seen[name]}")
+    return out
+
 def extract_markdown_tables(md: str, header_frac: float = 0.6):
     """
-    Extract pipe-delimited tables from messy markdown using simple heuristic:
-    - Header row: field_count >= header_frac * max_field_count
-    - Data rows: must match header's field_count
-    - Stop table when mismatch occurs
+    Extract pipe-delimited tables from messy markdown.
+    
+    Heuristic:
+      - A header row has field_count >= header_frac * max_field_count
+      - Data rows must match header's field_count
+      - Stops when mismatch occurs, then looks for next header
     """
     lines = md.split("\n")
-    tokenized = [ _tokenize(ln) for ln in lines if "|" in ln ]
+    tokenized = [_tokenize(ln) for ln in lines if "|" in ln]
     if not tokenized:
         return pd.DataFrame(), []
 
-    # max fields across all rows
+    # max number of fields across all rows
     max_fields = max(len(row) for row in tokenized)
     cutoff = math.ceil(header_frac * max_fields)
 
@@ -30,22 +44,23 @@ def extract_markdown_tables(md: str, header_frac: float = 0.6):
     def flush():
         nonlocal curr_header, curr_rows, curr_fields
         if curr_header is not None and curr_rows:
-            df = pd.DataFrame(curr_rows, columns=curr_header)
+            clean_header = _dedup_columns(curr_header)
+            df = pd.DataFrame(curr_rows, columns=clean_header)
             tables.append(df)
         curr_header, curr_rows, curr_fields = None, [], None
 
     for row in tokenized:
         n = len(row)
-        if curr_header is None:  # looking for a header
+        if curr_header is None:  # looking for header
             if n >= cutoff:
                 curr_header, curr_fields = row, n
-            # else ignore
+            # else: skip junk
         else:  # inside a table
             if n == curr_fields:
                 curr_rows.append(row)
             else:
                 flush()
-                if n >= cutoff:
+                if n >= cutoff:  # treat as next header
                     curr_header, curr_fields = row, n
 
     if curr_header is not None:
