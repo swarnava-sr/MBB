@@ -1,58 +1,85 @@
 import pandas as pd
 
-def extract_tables_from_markdown(md_string: str) -> pd.DataFrame:
+def extract_markdown_tables(md_string: str, threshold: float = 0.6):
     """
-    Extract tables from markdown-like string (using | separated rows and \n newlines).
-    Returns a concatenated pandas DataFrame from all detected tables.
+    Extract tables from a markdown string into pandas DataFrames.
+    
+    Args:
+        md_string (str): Markdown text with '|' separated rows.
+        threshold (float): Fraction of max columns required to consider a row as table header.
+        
+    Returns:
+        pd.DataFrame: Concatenated dataframe of all extracted tables.
+        list[pd.DataFrame]: List of individual table dataframes.
     """
-
-    # Split into lines
     lines = [line.strip() for line in md_string.split("\n") if line.strip()]
+    split_lines = [line.split("|") for line in lines if "|" in line]
 
-    # Split rows into list of values
-    split_lines = [line.strip("|").split("|") for line in lines]
+    # Normalize: strip whitespace from each cell
+    split_lines = [[cell.strip() for cell in row if cell.strip() != ""] for row in split_lines]
 
-    # Clean extra spaces
-    split_lines = [[col.strip() for col in row] for row in split_lines]
+    if not split_lines:
+        return pd.DataFrame(), []
 
-    # Find maximum column count
-    max_cols = max((len(row) for row in split_lines), default=0)
-
-    if max_cols == 0:
-        return pd.DataFrame()  # no tables found
-
-    # Threshold to decide if a row is a table header
-    min_header_cols = int(0.6 * max_cols)
+    # Determine max column count
+    max_cols = max(len(row) for row in split_lines)
 
     tables = []
     current_table = []
-    header = None
+    header_found = False
 
     for row in split_lines:
-        if len(row) >= min_header_cols:  
-            # Potential header row → start of a new table
-            if current_table and header:
-                # Convert old table to DataFrame
-                df = pd.DataFrame(current_table, columns=header)
+        if len(row) >= threshold * max_cols:
+            # Likely a header row
+            if current_table:
+                # save previous table if exists
+                try:
+                    df = pd.DataFrame(current_table[1:], columns=current_table[0])
+                except Exception:
+                    df = pd.DataFrame(current_table)
                 tables.append(df)
                 current_table = []
-
-            header = row  # set new header
+            current_table.append(row)
+            header_found = True
         else:
-            # Data row
-            if header:  # Only add if we already have a header
-                # Fill missing cols if uneven
-                while len(row) < len(header):
-                    row.append("")
+            # part of table if a header was found
+            if header_found:
                 current_table.append(row)
+            else:
+                # skip junk rows before any header
+                continue
 
-    # Catch last table
-    if current_table and header:
-        df = pd.DataFrame(current_table, columns=header)
+    # save last table
+    if current_table:
+        try:
+            df = pd.DataFrame(current_table[1:], columns=current_table[0])
+        except Exception:
+            df = pd.DataFrame(current_table)
         tables.append(df)
 
-    # Combine all tables (align columns automatically, NaNs for missing cols)
-    if tables:
-        return pd.concat(tables, ignore_index=True, sort=False)
-    else:
-        return pd.DataFrame()
+    # Concatenate
+    concatenated = pd.concat(tables, ignore_index=True) if tables else pd.DataFrame()
+    return concatenated, tables
+
+md = """
+Some intro text
+
+| Name | Age | City |
+| John | 25 | New York |
+| Alice | 30 | London |
+
+Some random footer
+
+| Product | Price |
+| Apple   | 100  |
+| Banana  | 50   |
+"""
+
+df_all, dfs = extract_markdown_tables(md)
+
+print("Concatenated DataFrame:")
+print(df_all)
+
+
+
+
