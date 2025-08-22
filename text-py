@@ -3,16 +3,14 @@ import pandas as pd
 from collections import Counter
 
 def _tokenize(line: str):
-    # Split by '|' and strip; drop leading/trailing empties from border pipes
     toks = [t.strip() for t in line.strip().split("|")]
-    if toks and toks[0] == "":
+    if toks and toks[0] == "":  # drop border pipes
         toks = toks[1:]
     if toks and toks[-1] == "":
         toks = toks[:-1]
     return toks
 
 def _value_count(tokens):
-    # "values" = non-empty cells
     return sum(1 for t in tokens if t != "")
 
 def _dedup_columns(cols):
@@ -24,109 +22,68 @@ def _dedup_columns(cols):
         out.append(name if seen[name] == 1 else f"{name}_{seen[name]}")
     return out
 
-def extract_markdown_tables(md: str, header_frac: float = 0.6):
+def extract_markdown_tables(md: str, header_frac: float = 0.6, pad_missing=True):
     """
-    Extract one or more pipe-delimited tables from a messy markdown string.
-    Heuristic: a header row has non-empty cell count >= header_frac * global_max_value_count.
+    Extract one or more pipe-delimited tables from messy markdown text.
+    Uses heuristic: a header row has non-empty count >= header_frac * global_max_nonempty.
     
     Returns:
         concatenated_df (pd.DataFrame), tables (list[pd.DataFrame])
     """
-    lines = [ln for ln in md.split("\n")]
-
-    # Precompute tokens/metrics for all lines that have at least one pipe
+    lines = md.split("\n")
     rows = []
     for ln in lines:
-        has_pipe = ("|" in ln)
-        toks = _tokenize(ln) if has_pipe else []
-        vals = _value_count(toks) if has_pipe else 0
+        if "|" not in ln:
+            rows.append({"line": ln, "tokens": [], "val_count": 0})
+            continue
+        toks = _tokenize(ln)
         rows.append({
             "line": ln,
-            "has_pipe": has_pipe,
             "tokens": toks,
-            "val_count": vals,
-            "field_count": len(toks)
+            "val_count": _value_count(toks)
         })
 
-    # Global max "value count" across pipe-lines
-    max_vals = max((r["val_count"] for r in rows if r["has_pipe"]), default=0)
+    max_vals = max((r["val_count"] for r in rows if r["tokens"]), default=0)
     if max_vals == 0:
         return pd.DataFrame(), []
 
-    header_cutoff = math.ceil(header_frac * max_vals)
+    cutoff = math.ceil(header_frac * max_vals)
 
-    tables = []
+    tables, curr_cols, curr_rows = [], [], []
     in_table = False
-    curr_cols = []
-    curr_rows = []
-    blank_streak = 0  # counts low-signal/blank lines between rows
 
-    def flush_table():
+    def flush():
         nonlocal curr_cols, curr_rows, in_table
         if curr_cols and curr_rows:
             df = pd.DataFrame(curr_rows, columns=curr_cols)
             tables.append(df)
-        curr_cols, curr_rows = [], []
-        in_table = False
+        curr_cols, curr_rows, in_table = [], [], False
 
-    for i, r in enumerate(rows):
-        if not r["has_pipe"]:
-            # Non-pipe line: potential separator
-            if in_table:
-                blank_streak += 1
-                if blank_streak >= 1:
-                    flush_table()
-            continue
-
+    for r in rows:
         toks = r["tokens"]
-        vals = r["val_count"]
-        fields = r["field_count"]
-
-        # Treat a "blankish" pipe line as a separator
-        is_blankish = (vals == 0 or fields == 0)
-
-        if not in_table:
-            # Only start a table when we're currently outside one
-            if not is_blankish and vals >= header_cutoff and fields >= 2:
-                curr_cols = _dedup_columns(toks if toks else [f"col_{k+1}" for k in range(max(1, fields))])
-                in_table = True
-                blank_streak = 0
-            # else: ignore this line as header/footer junk
+        if not toks:
+            if in_table:
+                flush()
             continue
 
-        # We are inside a table
-        if is_blankish:
-            blank_streak += 1
-            if blank_streak >= 1:
-                flush_table()
-            continue
-
-        blank_streak = 0
-
-        # Detect a strong structure change that likely indicates a new table head
-        # (no explicit blank line before it)
-        big_structure_change = abs(fields - len(curr_cols)) >= max(2, int(0.5 * max(1, len(curr_cols))))
-        looks_like_header = vals >= header_cutoff and fields >= 2
-
-        if looks_like_header and big_structure_change:
-            # Close previous table and start a new one using this line as header
-            flush_table()
-            curr_cols = _dedup_columns(toks if toks else [f"col_{k+1}" for k in range(max(1, fields))])
+        # detect header row
+        if not in_table and r["val_count"] >= cutoff:
+            curr_cols = _dedup_columns(toks)
             in_table = True
             continue
 
-        # Normal data row: align to current columns
-        if fields < len(curr_cols):
-            toks = toks + [""] * (len(curr_cols) - fields)
-        elif fields > len(curr_cols):
-            # Extend the current columns to accommodate extra cells
-            extra = fields - len(curr_cols)
-            curr_cols += _dedup_columns([f"col_{k+1}" for k in range(len(curr_cols), len(curr_cols) + extra)])
-        curr_rows.append(toks)
+        if in_table:
+            # data row
+            if len(toks) < len(curr_cols):
+                if pad_missing:
+                    toks = toks + [""] * (len(curr_cols) - len(toks))
+            elif len(toks) > len(curr_cols):
+                # truncate extras instead of creating fake col_x
+                toks = toks[:len(curr_cols)]
+            curr_rows.append(toks)
 
-    # Flush any trailing table
     if in_table:
-        flush_table()
+        flush()
 
-    concatenated = pd.concat(tables, ignore_index=True, sort=False) if tables else pd.DataFrame()
+    concatenated = pd.concat(tables, ignore_index=True) if tables else pd.DataFrame()
     return concatenated, tables
